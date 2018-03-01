@@ -5,6 +5,7 @@ import {getSelectors, getTotalIsolatedScope, makeInsert} from './utils';
 import {ElementFinder} from './ElementFinder';
 import {EventsFnOptions} from './DOMSource';
 import {Scope} from './isolate';
+import SymbolTree from './SymbolTree';
 import {
   fromEvent,
   preventDefaultConditional,
@@ -14,22 +15,17 @@ declare var requestIdleCallback: any;
 
 interface Destination {
   useCapture: boolean;
+  bubbles: boolean;
+  passive: boolean;
   scopeChecker: ScopeChecker;
   subject: Stream<Event>;
   preventDefault?: PreventDefaultOpt;
-  passive?: boolean;
 }
 
 export interface CycleDOMEvent extends Event {
   propagationHasBeenStopped: boolean;
   ownerTarget: Element;
 }
-
-interface ListenerTree {
-  [scope: string]: Map<string, Destination[]> | ListenerTree;
-}
-
-const listenerSymbol = Symbol('listener');
 
 export const eventTypesThatDontBubble = [
   `blur`,
@@ -82,11 +78,18 @@ interface NonBubblingListener {
  * isolation boundaries too.
  */
 export class EventDelegator {
-  private virtualListeners: ListenerTree;
+  private virtualListeners = new SymbolTree<
+    Map<string, Set<Destination>>,
+    Scope
+  >(x => x.scope);
   private origin: Element;
 
   private domListeners: Map<string, DOMListener>;
   private nonBubblingListeners: Map<string, Map<Element, NonBubblingListener>>;
+
+  private currentListeners: Set<Destination> = new Set<Destination>();
+  private toDelete: Destination[] = [];
+  private toDeleteSize = 0;
 
   constructor(
     private rootElement$: Stream<Element>,
@@ -98,7 +101,6 @@ export class EventDelegator {
       string,
       Map<Element, NonBubblingListener>
     >();
-    this.virtualListeners = {};
     rootElement$.addListener({
       next: el => {
         if (this.origin !== el) {
@@ -145,7 +147,7 @@ export class EventDelegator {
 
   public removeElement(element: Element, namespace?: Scope[]): void {
     if (namespace !== undefined) {
-      this.removeVirtualListener(namespace);
+      //this.removeVirtualListener(namespace);
     }
     const toRemove: [string, Element][] = [];
     this.nonBubblingListeners.forEach((map, type) => {
@@ -171,51 +173,66 @@ export class EventDelegator {
     subject: Stream<Event>,
     scopeChecker: ScopeChecker,
     eventType: string,
-    {useCapture, preventDefault, passive}: EventsFnOptions,
+    options: EventsFnOptions,
   ): Destination {
-    let curr = this.virtualListeners;
-    for (let i = 0; i < scopeChecker.namespace.length; i++) {
-      const n = scopeChecker.namespace[i];
-      if (n.type === 'selector') {
-        continue;
-      }
-      curr[n.scope] = (curr[n.scope] || {}) as ListenerTree;
-      curr = curr[n.scope] as ListenerTree;
-    }
+    const relevantSets: Set<Destination>[] = [];
+    let namespace = scopeChecker.namespace
+      .filter(n => n.type !== 'selector');
+
+    do {
+      relevantSets.push(
+        this.getVirtualListeners(eventType, namespace, true)
+      );
+      namespace.splice(0, namespace.length - 1);
+    } while(namespace.length > 0 && namespace[namespace.length - 1].type !== 'total');
+
     const destination = {
-      useCapture: !!useCapture,
+      ...options,
       scopeChecker,
       subject,
-      preventDefault,
-      passive,
+      bubbles: !!options.bubbles,
+      useCapture: !!options.useCapture,
+      passive: !!options.passive
     };
-    let map = curr[listenerSymbol] as Map<string, Destination[]>;
-    if (map === undefined) {
-      curr[listenerSymbol] = new Map<string, Destination[]>();
-      map = curr[listenerSymbol] as Map<string, Destination[]>;
+
+    for (let i = 0; i < relevantSets.length; i++) {
+      relevantSets[i].add(destination);
     }
-    const oldDestinations = map.get(eventType) || [];
-    map.set(eventType, oldDestinations.concat(destination));
+
     return destination;
   }
 
+  /**
+   * Returns a set of all virtual listeners in the scope of the namespace
+   * Set `exact` to true to treat sibiling isolated scopes as total scopes
+   */
   private getVirtualListeners(
-    type: string,
+    eventType: string,
     namespace: Scope[],
-  ): Destination[] | undefined {
-    let curr: ListenerTree = this.virtualListeners;
-    for (let i = 0; i < namespace.length; i++) {
-      const child = curr[namespace[i].scope] as ListenerTree;
-      if (child === undefined) {
-        return undefined;
+    exact = false,
+  ): Set<Destination> {
+    let max = namespace.length;
+    if (!exact) {
+      for (let i = max - 1; i >= 0; i--) {
+        if (namespace[i].type === 'total') {
+          max = i + 1;
+          break;
+        }
       }
-      curr = child;
     }
-    const map = curr[listenerSymbol] as Map<string, Destination[]>;
-    return map ? map.get(type) : undefined;
+    const map = this.virtualListeners.getDefault(
+      namespace,
+      () => new Map<string, Set<Destination>>(),
+      max,
+    );
+
+    if (!map.has(eventType)) {
+      map.set(eventType, new Set<Destination>());
+    }
+    return map.get(eventType) as Set<Destination>;
   }
 
-  private removeVirtualListener(namespace: Scope[]): void {
+  /*private removeVirtualListener(namespace: Scope[]): void {
     let curr: ListenerTree = this.virtualListeners;
     for (let i = 0; i < namespace.length; i++) {
       const child = curr[namespace[i].scope] as ListenerTree;
@@ -241,7 +258,7 @@ export class EventDelegator {
         delete curr[namespace[i].scope];
       }
     }
-  }
+  }*/
 
   private setupDOMListener(eventType: string, passive: boolean): void {
     const sub = fromEvent(
@@ -338,89 +355,134 @@ export class EventDelegator {
     });
   }
 
-  private buildPath(element: Element, namespace: Array<Scope>): Element[] {
-    const totalNamespace = getTotalIsolatedScope(namespace);
-    const root = this.isolateModule.getElement(totalNamespace);
-    let curr = element;
-    const result: Element[] = [element];
-    do {
-      curr = curr.parentNode as Element;
-      result.push(curr);
-    } while (curr && curr !== root);
-    return result;
+  private resetCurrentListeners(
+    listeners: Set<Destination>,
+    useCapture: boolean,
+    passive: boolean,
+  ): void {
+    this.currentListeners.clear();
+    listeners.forEach(v => {
+      if (v.useCapture === useCapture && v.passive === passive) {
+        this.currentListeners.add(v);
+      }
+    });
   }
 
   private onEvent(
-    type: string,
+    eventType: string,
     event: Event,
     passive: boolean,
     bubbles = true,
   ): void {
+    debugger;
     const namespace = this.isolateModule.getNamespace(event.target as Element);
-    const path = this.buildPath(event.target as Element, namespace);
-    const cycleEvent = this.patchEvent(event);
-    this.bubble(
-      type,
-      cycleEvent,
-      true,
-      path.slice(0).reverse(),
-      namespace,
-      passive,
-      bubbles,
+    const rootElement = this.isolateModule.getRootElement(
+      event.target as Element,
     );
-    this.bubble(type, cycleEvent, false, path, namespace, passive, bubbles);
+    const cycleEvent = this.patchEvent(event);
+    const listeners = this.getVirtualListeners(eventType, namespace);
+
+    if (bubbles) {
+      this.resetCurrentListeners(listeners, true, passive);
+      this.bubble(
+        eventType,
+        event.target as Element,
+        rootElement,
+        cycleEvent,
+        namespace,
+        namespace.length - 1,
+        true,
+      );
+
+      this.resetCurrentListeners(listeners, false, passive);
+      this.bubble(
+        eventType,
+        event.target as Element,
+        rootElement,
+        cycleEvent,
+        namespace,
+        namespace.length - 1,
+        false,
+      );
+    } else {
+      /*
+      //TODO: Add useCapture listener to this.currentListeners
+      this.doBubbleStep(eventType, event.target as Element, cycleEvent);
+      //TODO: Add useCapture listener to this.currentListeners
+      this.doBubbleStep(eventType, event.target as Element, cycleEvent);
+       */
+    }
   }
 
   private bubble(
-    type: string,
+    eventType: string,
+    elm: Element,
+    rootElement: Element,
     event: CycleDOMEvent,
+    namespace: Scope[],
+    index: number,
     useCapture: boolean,
-    path: Element[],
-    namespace: Array<Scope>,
-    passive: boolean,
-    bubbles: boolean,
   ): void {
-    let n = namespace;
-    do {
-      const destinations = this.getVirtualListeners(type, n);
-      const processed = new Set<Destination>();
-      if (destinations !== undefined) {
-        for (let i = 0; i < path.length; i++) {
-          for (let j = 0; j < destinations.length; j++) {
-            const d = destinations[j];
-            if (event.propagationHasBeenStopped) {
-              return;
-            }
-            if (
-              !!d.useCapture !== useCapture ||
-              processed.has(destinations[j]) ||
-              !!d.passive !== passive
-            ) {
-              continue;
-            }
-            const currentEvent = this.mutateEventCurrentTarget(event, path[i]);
-            const selector = getSelectors(d.scopeChecker.namespace);
-            if (
-              bubbles ||
-              (!bubbles && useCapture && i === path.length - 1) ||
-              (!bubbles && !useCapture && i === 0)
-            ) {
-              if ((selector && path[i].matches(selector)) || !selector) {
-                if (d.preventDefault) {
-                  preventDefaultConditional(event, d.preventDefault);
-                }
-                destinations[j].subject.shamefullySendNext(event);
-                processed.add(destinations[j]);
-              }
-            }
-          }
+    if (!useCapture && !event.propagationHasBeenStopped) {
+      this.doBubbleStep(eventType, elm, rootElement, event);
+    }
+
+    if (elm !== rootElement) {
+      let newRoot = rootElement;
+      let newIndex = index;
+      if (elm === rootElement) {
+        if (namespace[index].type === 'sibling') {
+          newRoot = this.isolateModule.getRootElement(
+            elm.parentNode as Element,
+          );
+          newIndex--;
         }
       }
-      if (n.length === 0 || n[n.length - 1].type === 'total') {
-        break;
+
+      this.bubble(
+        eventType,
+        elm.parentNode as Element,
+        newRoot,
+        event,
+        namespace,
+        newIndex,
+        useCapture,
+      );
+    }
+
+    if (useCapture && !event.propagationHasBeenStopped) {
+      this.doBubbleStep(eventType, elm, rootElement, event);
+    }
+  }
+
+  private doBubbleStep(
+    eventType: string,
+    elm: Element,
+    rootElement: Element,
+    event: CycleDOMEvent,
+  ): void {
+    this.mutateEventCurrentTarget(event, elm);
+    this.currentListeners.forEach(dest => {
+      const sel = getSelectors(dest.scopeChecker.namespace);
+      if (
+        (sel !== '' && elm.matches(sel)) ||
+        (sel === '' && elm === rootElement)
+      ) {
+        preventDefaultConditional(event, dest.preventDefault);
+        dest.subject.shamefullySendNext(event);
+
+        if (this.toDelete.length === this.toDeleteSize) {
+          this.toDelete.push(dest);
+        } else {
+          this.toDelete[this.toDeleteSize] = dest;
+        }
+        this.toDeleteSize++;
       }
-      n = n.slice(0, n.length - 1);
-    } while (true);
+    });
+    for(let i = 0; i < this.toDeleteSize; i++) {
+      this.currentListeners.delete(this.toDelete[i]);
+    }
+    this.toDeleteSize = 0;
   }
 
   private patchEvent(event: Event): CycleDOMEvent {
